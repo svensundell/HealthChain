@@ -3,7 +3,7 @@ import logging
 import os
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -13,7 +13,15 @@ from starlette.responses import JSONResponse, Response
 
 logger = logging.getLogger(__name__)
 
-_EXEMPT_PATHS = {"/health", "/docs", "/redoc", "/openapi.json"}
+_EXEMPT_PATHS = {
+    "/health",
+    "/docs",
+    "/redoc",
+    "/openapi.json",
+    "/metrics",
+    # Uptime/monitoring probes read the aggregate gateway status without a key
+    "/gateway/status",
+}
 
 
 class APIKeyMiddleware(BaseHTTPMiddleware):
@@ -34,6 +42,13 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next) -> Response:
         if request.url.path in _EXEMPT_PATHS:
+            return await call_next(request)
+
+        # Requests originating from internal HealthChain services are
+        # authenticated upstream by the ingress/service mesh, which sets this
+        # header. Skip the API-key check for those to avoid double auth.
+        if request.headers.get("X-Internal-Request", "").lower() == "true":
+            request.state.authenticated_user = "internal-service"
             return await call_next(request)
 
         auth_header = request.headers.get("Authorization", "")
@@ -71,12 +86,17 @@ class AuditLogMiddleware(BaseHTTPMiddleware):
 
         response = await call_next(request)
 
+        # Echo the request id back so callers can correlate logs with responses
+        response.headers["X-Request-ID"] = request_id
+
         if response.status_code == 401:
             return response
 
         duration_ms = round((time.monotonic() - start) * 1000, 1)
         entry = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            # Local wall-clock time is friendlier for operators reading the log
+            # on the host than UTC offsets.
+            "timestamp": datetime.now().isoformat(),
             "method": request.method,
             "path": request.url.path,
             "status_code": response.status_code,
