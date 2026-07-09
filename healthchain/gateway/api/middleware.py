@@ -3,7 +3,7 @@ import logging
 import os
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -13,7 +13,15 @@ from starlette.responses import JSONResponse, Response
 
 logger = logging.getLogger(__name__)
 
-_EXEMPT_PATHS = {"/health", "/docs", "/redoc", "/openapi.json", "/metrics"}
+_EXEMPT_PATHS = {
+    "/health",
+    "/docs",
+    "/redoc",
+    "/openapi.json",
+    "/metrics",
+    # Uptime/monitoring probes read the aggregate gateway status without a key
+    "/gateway/status",
+}
 
 
 class APIKeyMiddleware(BaseHTTPMiddleware):
@@ -86,7 +94,9 @@ class AuditLogMiddleware(BaseHTTPMiddleware):
 
         duration_ms = round((time.monotonic() - start) * 1000, 1)
         entry = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            # Local wall-clock time is friendlier for operators reading the log
+            # on the host than UTC offsets.
+            "timestamp": datetime.now().isoformat(),
             "method": request.method,
             "path": request.url.path,
             "status_code": response.status_code,
