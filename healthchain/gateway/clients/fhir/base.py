@@ -37,6 +37,16 @@ class FHIRAuthConfig(BaseModel):
     timeout: int = 30
     verify_ssl: bool = True
 
+    # Connection pool tuning (mapped to httpx.Limits)
+    max_connections: int = 100
+    max_keepalive_connections: int = 20
+
+    # Retry policy for outbound FHIR HTTP calls
+    retry_max_attempts: int = 3
+    retry_backoff_base: float = 0.5
+    retry_backoff_factor: float = 2.0
+    retry_max_backoff: float = 8.0
+
     # OAuth2 settings (optional - for authenticated endpoints)
     client_id: Optional[str] = None
     client_secret: Optional[str] = None  # Client secret string for standard flow
@@ -89,6 +99,26 @@ class FHIRAuthConfig(BaseModel):
             raise ValueError(
                 "client_secret_path can only be used with use_jwt_assertion=True"
             )
+
+    def to_httpx_limits(self) -> "httpx.Limits":
+        """Build an httpx.Limits object from the configured pool settings."""
+        import httpx
+
+        return httpx.Limits(
+            max_connections=self.max_connections,
+            max_keepalive_connections=self.max_keepalive_connections,
+        )
+
+    def to_retry_policy(self) -> "RetryPolicy":
+        """Build a RetryPolicy for outbound FHIR HTTP calls."""
+        from healthchain.gateway.clients.retry import RetryPolicy
+
+        return RetryPolicy(
+            max_attempts=self.retry_max_attempts,
+            backoff_base=self.retry_backoff_base,
+            backoff_factor=self.retry_backoff_factor,
+            max_backoff=self.retry_max_backoff,
+        )
 
     def to_oauth2_config(self) -> OAuth2Config:
         """Convert to OAuth2Config for token manager."""
@@ -165,6 +195,10 @@ class FHIRAuthConfig(BaseModel):
             os.getenv(f"{env_prefix}_USE_JWT_ASSERTION", "false").lower() == "true"
         )
         key_id = os.getenv(f"{env_prefix}_KEY_ID")
+        max_connections = int(os.getenv(f"{env_prefix}_MAX_CONNECTIONS", "100"))
+        max_keepalive = int(os.getenv(f"{env_prefix}_MAX_KEEPALIVE_CONNECTIONS", "20"))
+        retry_max_attempts = int(os.getenv(f"{env_prefix}_RETRY_MAX_ATTEMPTS", "3"))
+        retry_backoff_base = float(os.getenv(f"{env_prefix}_RETRY_BACKOFF_BASE", "0.5"))
 
         return cls(
             client_id=client_id,
@@ -178,6 +212,10 @@ class FHIRAuthConfig(BaseModel):
             verify_ssl=verify_ssl,
             use_jwt_assertion=use_jwt_assertion,
             key_id=key_id,
+            max_connections=max_connections,
+            max_keepalive_connections=max_keepalive,
+            retry_max_attempts=retry_max_attempts,
+            retry_backoff_base=retry_backoff_base,
         )
 
     def to_connection_string(self) -> str:
@@ -241,6 +279,7 @@ class FHIRServerInterface(ABC):
         self.base_url = auth_config.base_url.rstrip("/") + "/"
         self.timeout = auth_config.timeout
         self.verify_ssl = auth_config.verify_ssl
+        self.auth_config = auth_config
 
         # Setup base headers
         self.base_headers = {
@@ -351,6 +390,36 @@ class FHIRServerInterface(ABC):
         """Get the capabilities of the FHIR server."""
         pass
 
+    @abstractmethod
+    def patch(
+        self,
+        resource_type: Union[str, Type[Resource]],
+        resource_id: str,
+        patch_body: list,
+    ) -> Resource:
+        """Apply a JSON Patch to a resource (FHIR PATCH interaction)."""
+        pass
+
+    @abstractmethod
+    def vread(
+        self,
+        resource_type: Union[str, Type[Resource]],
+        resource_id: str,
+        version_id: str,
+    ) -> Resource:
+        """Read a specific version of a resource (FHIR vread interaction)."""
+        pass
+
+    @abstractmethod
+    def history(
+        self,
+        resource_type: Union[str, Type[Resource]],
+        resource_id: str,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Bundle:
+        """Read the version history for a resource (FHIR history interaction)."""
+        pass
+
 
 def parse_fhir_auth_connection_string(connection_string: str) -> FHIRAuthConfig:
     """
@@ -402,7 +471,7 @@ def parse_fhir_auth_connection_string(connection_string: str) -> FHIRAuthConfig:
         return FHIRAuthConfig(
             base_url=base_url,
             timeout=int(params.get("timeout", 30)),
-            verify_ssl=params.get("verify_ssl", "true").lower() == "true",
+            verify_ssl=params.get("verify_ssl", "false").lower() == "true",
         )
 
     # If any auth param is present, validate complete auth config
@@ -416,7 +485,7 @@ def parse_fhir_auth_connection_string(connection_string: str) -> FHIRAuthConfig:
         audience=params.get("audience"),
         base_url=base_url,
         timeout=int(params.get("timeout", 30)),
-        verify_ssl=params.get("verify_ssl", "true").lower() == "true",
+        verify_ssl=params.get("verify_ssl", "false").lower() == "true",
         use_jwt_assertion=params.get("use_jwt_assertion", "false").lower() == "true",
         key_id=params.get("key_id"),
     )
