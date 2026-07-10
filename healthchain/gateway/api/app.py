@@ -316,6 +316,20 @@ class HealthChainAPI(FastAPI):
 
             self.add_middleware(APIKeyMiddleware)
 
+        if _config and _config.observability.metrics:
+            from healthchain.gateway.api.metrics import (
+                MetricsCollector,
+                RequestMetricsMiddleware,
+                set_metrics_collector,
+            )
+
+            collector = MetricsCollector(
+                slow_threshold_ms=_config.observability.slow_threshold_ms,
+                slow_sample_size=_config.observability.slow_sample_size,
+            )
+            set_metrics_collector(collector)
+            self.add_middleware(RequestMetricsMiddleware, collector=collector)
+
         # Add global exception handler
         self.add_exception_handler(Exception, self._exception_handler)
 
@@ -549,6 +563,53 @@ class HealthChainAPI(FastAPI):
         async def health_check():
             """Health check endpoint."""
             return {"status": "healthy"}
+
+        @self.get("/metrics")
+        async def metrics():
+            """In-process request metrics (enabled via observability.metrics)."""
+            from healthchain.gateway.api.metrics import metrics_json_response
+
+            return metrics_json_response()
+
+        @self.get("/gateway/status")
+        async def gateway_status():
+            """Aggregate status for all registered gateways, services, and config."""
+            from healthchain.config.appconfig import AppConfig
+
+            config = AppConfig.load()
+
+            def _component_status(components, endpoints_registry):
+                result = {}
+                for name, component in components.items():
+                    entry = {"endpoints": list(endpoints_registry.get(name, set()))}
+                    if hasattr(component, "get_gateway_status"):
+                        entry["status"] = component.get_gateway_status()
+                    elif hasattr(component, "get_metadata"):
+                        entry["metadata"] = component.get_metadata()
+                    result[name] = entry
+                return result
+
+            status = {
+                "api": {
+                    "name": self.title,
+                    "version": self.version,
+                    "events_enabled": self.enable_events,
+                },
+                "gateways": _component_status(self.gateways, self.gateway_endpoints),
+                "services": _component_status(self.services, self.service_endpoints),
+            }
+
+            if config:
+                status["config"] = {
+                    "environment": config.site.environment,
+                    "auth": config.security.auth,
+                    "tls_enabled": config.security.tls.enabled,
+                    "audit_log": config.compliance.audit_log is not None,
+                    "metrics_enabled": config.observability.metrics,
+                    "sources": list(config.sources.keys()),
+                }
+
+            return status
 
         @self.get("/metadata")
         async def metadata():
