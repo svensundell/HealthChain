@@ -35,6 +35,13 @@ Missing or incorrect keys receive a `401 Unauthorized` response:
 { "detail": "Invalid or missing API key" }
 ```
 
+### Internal service requests
+
+When HealthChain runs behind a service mesh or trusted ingress that performs
+its own authentication, downstream calls carry an `X-Internal-Request: true`
+header. These requests skip the gateway's own API-key check to avoid
+authenticating twice, and are recorded in the audit log as `internal-service`.
+
 !!! warning "Missing env var"
 If `HEALTHCHAIN_API_KEY` is not set when the service starts, a warning is logged and all authenticated requests will be rejected. The service still starts — misconfiguration is visible without crashing.
 
@@ -93,3 +100,94 @@ openssl req -x509 -newkey rsa:4096 -keyout certs/server.key \
 ```
 
 **For production**, use a certificate issued by a trusted CA. If you're deploying behind a reverse proxy (nginx, Caddy, an NHS load balancer), terminate TLS at the proxy and leave `tls.enabled: false` in HealthChain — the proxy handles the certificate, HealthChain handles the application.
+
+---
+
+## Outbound resilience & connection pooling
+
+Outbound FHIR and OAuth2 token requests use a shared exponential-backoff retry
+policy (see `healthchain.gateway.clients.retry`) so transient `429`/`5xx`
+responses and connection resets are retried automatically before surfacing an
+error.
+
+Connection pooling for FHIR clients is tunable through the connection config:
+
+```python
+from healthchain.gateway.clients.fhir.base import FHIRAuthConfig
+
+config = FHIRAuthConfig(
+    base_url="https://epic.com/api/FHIR/R4",
+    max_connections=100,
+    max_keepalive_connections=20,
+)
+```
+
+These map directly to `httpx.Limits`. Certificate verification for outbound
+connections is controlled per-source via `verify_ssl` (see the connection
+string reference).
+
+Per-source retry and pool settings can also be declared in `healthchain.yaml`:
+
+```yaml
+sources:
+  epic:
+    env_prefix: EPIC
+    retry:
+      max_attempts: 5
+      backoff_base: 1.0
+    pool:
+      max_connections: 50
+      max_keepalive_connections: 10
+```
+
+---
+
+## Request metrics
+
+Enable in-process request metrics by setting `observability.metrics: true`:
+
+```yaml
+observability:
+  metrics: true
+```
+
+This adds a `RequestMetricsMiddleware` that tracks per-route latency and
+error rates. Metrics are exposed at `GET /metrics` as JSON:
+
+```json
+{
+  "uptime_seconds": 3600.5,
+  "total_requests": 1247,
+  "total_errors": 3,
+  "routes": {
+    "GET /fhir/Patient/{id}": {
+      "request_count": 412,
+      "error_count": 1,
+      "avg_duration_ms": 18.4
+    }
+  }
+}
+```
+
+Path segments containing UUIDs or numeric IDs are normalised to `{id}` to keep
+cardinality manageable.
+
+---
+
+## Gateway status
+
+`GET /gateway/status` returns an aggregate view of registered gateways,
+services, and loaded configuration (no secrets):
+
+```json
+{
+  "api": { "name": "my-app", "version": "1.0.0", "events_enabled": true },
+  "gateways": { "FHIRGateway": { "status": { "...": "..." } } },
+  "config": {
+    "environment": "production",
+    "auth": "api-key",
+    "metrics_enabled": true,
+    "sources": ["epic"]
+  }
+}
+```
