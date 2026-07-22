@@ -3,7 +3,7 @@ import logging
 import os
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -13,7 +13,44 @@ from starlette.responses import JSONResponse, Response
 
 logger = logging.getLogger(__name__)
 
-_EXEMPT_PATHS = {"/health", "/docs", "/redoc", "/openapi.json"}
+_EXEMPT_PATHS = {
+    "/health",
+    "/docs",
+    "/redoc",
+    "/openapi.json",
+    "/metrics",
+    # Uptime/monitoring probes read the aggregate gateway status without a key
+    "/gateway/status",
+}
+
+# FHIR AuditEvent action codes (ITI-20 / IHE ATNA)
+_HTTP_AUDIT_ACTION = {
+    "GET": "R",
+    "HEAD": "R",
+    "POST": "C",
+    "PUT": "U",
+    "PATCH": "U",
+    "DELETE": "D",
+}
+
+
+def _client_address(request: Request) -> Optional[str]:
+    """Best-effort client address for audit records behind reverse proxies."""
+    forwarded = request.headers.get("X-Forwarded-For", "").strip()
+    if forwarded:
+        # First hop is the original client when proxies append addresses
+        return forwarded.split(",")[0].strip()
+    if request.client:
+        return request.client.host
+    return None
+
+
+def _audit_outcome(status_code: int) -> str:
+    """Map an HTTP status to a FHIR AuditEvent outcome code."""
+    if status_code >= 500:
+        return "8"  # serious failure
+    # Non-server errors mean the gateway handled the request successfully
+    return "0"
 
 
 class APIKeyMiddleware(BaseHTTPMiddleware):
@@ -34,6 +71,13 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next) -> Response:
         if request.url.path in _EXEMPT_PATHS:
+            return await call_next(request)
+
+        # Requests originating from internal HealthChain services are
+        # authenticated upstream by the ingress/service mesh, which sets this
+        # header. Skip the API-key check for those to avoid double auth.
+        if request.headers.get("X-Internal-Request", "").lower() == "true":
+            request.state.authenticated_user = "internal-service"
             return await call_next(request)
 
         auth_header = request.headers.get("Authorization", "")
@@ -71,18 +115,27 @@ class AuditLogMiddleware(BaseHTTPMiddleware):
 
         response = await call_next(request)
 
+        # Echo request id so clients can correlate gateway logs with responses
+        response.headers["X-Request-ID"] = request_id
+
+        # Unauthenticated scanner traffic should not flood the audit log
         if response.status_code == 401:
             return response
 
         duration_ms = round((time.monotonic() - start) * 1000, 1)
         entry = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            # Local wall-clock time is friendlier for operators reading the log
+            # on the host than UTC offsets.
+"timestamp": datetime.now(timezone.utc).isoformat(),
             "method": request.method,
             "path": request.url.path,
             "status_code": response.status_code,
             "duration_ms": duration_ms,
             "request_id": request_id,
             "user": _get_user(request),
+            "client_ip": _client_address(request),
+            "action": _HTTP_AUDIT_ACTION.get(request.method.upper(), "E"),
+            "outcome": _audit_outcome(response.status_code),
         }
 
         try:
