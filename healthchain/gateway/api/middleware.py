@@ -126,7 +126,7 @@ class AuditLogMiddleware(BaseHTTPMiddleware):
         entry = {
             # Local wall-clock time is friendlier for operators reading the log
             # on the host than UTC offsets.
-            "timestamp": datetime.now().isoformat(),
+"timestamp": datetime.now(timezone.utc).isoformat(),
             "method": request.method,
             "path": request.url.path,
             "status_code": response.status_code,
